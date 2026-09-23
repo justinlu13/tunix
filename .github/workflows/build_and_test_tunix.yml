@@ -17,11 +17,13 @@
 
 name: Tunix Package Tests
 
-# Trigger the workflow only when code is merging to the 'main' branch.
+# Trigger the workflow when code is merging to 'main' or active MLPerf branches.
 on:
   pull_request: # Automatically trigger on pull requests affecting this file
     branches:
       - main
+      - 'mlperf/**'
+      - atwigg/mlperf
     types: [opened, synchronize, reopened, labeled]
     paths-ignore:
       - '**.md'
@@ -47,6 +49,18 @@ permissions:
 jobs:
   build_tunix_package:
     name: Build tunix package
+    # On pull_request 'labeled' events, only trigger the pipeline when a
+    # maintainer applies 'ready-to-submit' to an external fork PR.
+    # Same-repo PRs (including Copybara exports) already run CPU and TPU CI
+    # automatically on 'opened', 'synchronize', and 'reopened'; skipping
+    # 'labeled' events on same-repo PRs prevents a cosmetic label change from
+    # canceling an in-flight TPU run or triggering a duplicate run.
+    if: >-
+      ${{
+        github.event.action != 'labeled' ||
+        (github.event.label.name == 'ready-to-submit' &&
+         github.event.pull_request.head.repo.full_name != github.repository)
+      }}
     uses: ./.github/workflows/build_package.yml
 
   tunix_cpu_unit_tests:
@@ -60,7 +74,18 @@ jobs:
 
   tunix_tpu_unit_tests:
     needs: build_tunix_package
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ready-to-submit') }}
+    # Run TPU unit tests automatically on:
+    #   1. Non-PR events (scheduled runs, workflow_dispatch).
+    #   2. Same-repo PRs (internal Copybara exports and team feature branches).
+    #   3. External fork PRs ONLY after a maintainer applies 'ready-to-submit'
+    #      (prevents untrusted fork PRs from executing unreviewed code on
+    #      self-hosted Google Cloud TPU runners).
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository ||
+        contains(github.event.pull_request.labels.*.name, 'ready-to-submit')
+      }}
     uses: ./.github/workflows/tpu-tests.yml
     secrets:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}

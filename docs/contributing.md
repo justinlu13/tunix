@@ -69,25 +69,26 @@ contribution.
 During review and development, standard CPU unit tests, package builds, and
 documentation checks run automatically on every pull request push.
 
-### 6. TPU CI Validation (`ready-to-submit` label)
+### 6. TPU CI Validation
 
-To conserve shared hardware resources and prevent long queue times on live TPU
-runners, multi-device TPU integration tests do not run automatically on every
-pull request update.
+For pull requests originating from branches within `google/tunix` (including
+Copybara-synced pull requests), multi-device TPU integration tests
+(`tunix_tpu_unit_tests`) run **automatically** on every pull request push.
 
-Once your pull request has completed code review, addressed all reviewer comments,
-and is ready for final verification:
-1. A project maintainer will apply the `ready-to-submit` label to the pull
-   request.
-2. The `ready-to-submit` label automatically triggers the comprehensive TPU test
-   suite (`tunix_tpu_unit_tests`) running against live TPU accelerators.
+For pull requests submitted from **external forks**, TPU integration tests do
+not run automatically on self-hosted TPU runners until reviewed by a
+maintainer:
+1. Once your external pull request has completed code review, a project
+   maintainer will apply the `ready-to-submit` label to the pull request.
+2. The `ready-to-submit` label triggers the TPU test suite (`tunix_tpu_unit_tests`)
+   running against live TPU accelerators.
 3. If further commits are pushed to the pull request while the `ready-to-submit`
    label is present, TPU tests will automatically re-run.
 
 ### 7. Internal Import and Merging
 
 Once the pull request has been approved and all CI checks (including the TPU test
-suite triggered by `ready-to-submit`) have passed:
+suite) have passed:
 1. The PR will be converted/imported into Google's internal repository.
 2. The change is verified and approved from the internal review workflow.
 3. The change is submitted internally, which automatically syncs to GitHub and

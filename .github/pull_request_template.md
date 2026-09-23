@@ -20,4 +20,4 @@ Resolves #\<issue_number_goes_here\>
 - [ ] I have signed the [Contributor License Agreement](https://cla.developers.google.com/about).
 - [ ] I have followed [Contribution Guidelines](https://github.com/google/tunix/blob/main/docs/contributing.md).
 
-> **Note**: Standard CPU unit tests, package builds, and documentation checks will run automatically on pull requests. Once the PR is approved and ready for submission, maintainers will add the `ready-to-submit` label to trigger full TPU testing.
+> **Note**: Standard CPU unit tests, package builds, documentation checks, and TPU integration tests (`tunix_tpu_unit_tests`) run automatically on pull requests from `google/tunix` branches. For pull requests from external forks, maintainers will add the `ready-to-submit` label once reviewed to trigger full TPU testing.
