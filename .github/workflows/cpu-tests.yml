@@ -19,6 +19,11 @@ name: Run Tests Against Tunix Package
 
 on:
   workflow_call:
+    inputs:
+      dev_image:
+        description: 'Immutable Tunix Docker image URI built for this workflow run'
+        required: false
+        type: string
     secrets:
       HF_TOKEN:
         description: 'HuggingFace token for model downloads'
@@ -32,6 +37,12 @@ on:
 
 permissions:
   contents: read
+
+# Persist XLA CPU compiled kernels across runs so JAX unit tests do not
+# recompile identical graphs on every CI invocation.
+env:
+  JAX_COMPILATION_CACHE_DIR: /home/runner/.cache/jax_compilation_cache
+
 jobs:
   run_core:
     runs-on: ubuntu-latest
@@ -42,17 +53,29 @@ jobs:
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+
+      - name: Cache JAX CPU compilation
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: /home/runner/.cache/jax_compilation_cache
+          key: jax-cpu-core-v1-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            jax-cpu-core-v1-${{ runner.os }}-
 
       - name: Download the tunix wheel
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: tunix-wheel
 
+      # Use `uv pip install --system` instead of bare `pip install` for ~7x
+      # faster dependency resolution and wheel extraction on ephemeral runners.
       - name: Install the tunix wheel
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade uv
           WHEEL=$(ls -1 google_tunix-*-py3-none-any.whl | head -n1)
-          python -m pip install "${WHEEL}[prod,test,experimental]"
+          uv pip install --system pytest-xdist "datasets>=3.0.0" "${WHEEL}[prod,test,experimental]"
 
       - name: Verify Tunix imports from installed package
         run: |
@@ -67,13 +90,17 @@ jobs:
           assert tunix.__version__ != '0.0.0.dev0', 'Tunix version not set correctly'
           print('All tunix modules imported successfully and version is', tunix.__version__)
           "
+      # Parallelize multi-file CPU unit test suites across runner vCPUs using
+      # `pytest-xdist` (`-n auto`). `--dist=loadfile` keeps all tests within a
+      # file on the same worker so module-scoped JAX fixtures/models are only
+      # initialized once.
       - name: Run agentic RL tests
         run: |
-          python -m pytest tests/rl/agentic/ -v --tb=short
+          python -m pytest -n auto --dist=loadfile tests/rl/agentic/ -v --tb=short
 
       - name: Run RL unit tests
         run: |
-          python -m pytest tests/rl/ -v --tb=short -k "not test_grpo_with_lora_model" --ignore=tests/rl/agentic --ignore=tests/rl/rl_cluster_test.py
+          python -m pytest -n auto --dist=loadfile tests/rl/ -v --tb=short -k "not test_grpo_with_lora_model" --ignore=tests/rl/agentic --ignore=tests/rl/rl_cluster_test.py
 
       - name: Run Cli utils tests
         run: |
@@ -89,27 +116,36 @@ jobs:
 
       - name: Run model tests
         run: |
-          python -m pytest tests/models/ -v --tb=short \
+          python -m pytest -n auto --dist=loadfile tests/models/ -v --tb=short \
             --ignore=tests/models/naming_test.py
 
       - name: Compile gRPC Protobuf definitions
         run: |
-          python -m pip install grpcio-tools
+          uv pip install --system grpcio-tools
           find tunix/experimental/distributed -name "*.proto" -exec \
             python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. {} +
 
       - name: Run experimental tests
         run: |
           # TODO(tunix-dev): add back raiden tests after tpu_sync lib is ready.
-          python -m pytest tests/experimental/ -v --tb=short \
+          python -m pytest -n auto --dist=loadfile tests/experimental/ -v --tb=short \
             --ignore-glob='*/raiden_*.py' \
             --ignore=tests/experimental/weight_sync/weight_sync_test.py \
             --ignore=tests/experimental/rollout/vllm_sampler_v2_test.py
 
+  # ---------------------------------------------------------------------------
+  # Job: run_vllm
+  # Purpose: Run CPU-compatible vLLM driver and rollout unit tests inside the
+  #          immutable `tunix/mlperf` container image resolved/built by
+  #          `build_tunix_docker` (the exact same image used by `tpu-tests / run_dev`).
+  # ---------------------------------------------------------------------------
   run_vllm:
-    runs-on: ubuntu-latest
+    runs-on: linux-x86-n2-8
     container:
-      image: vllm/vllm-tpu:nightly-20260911-4b80060-51da0ca # zizmor: ignore[unpinned-images]
+      image: ${{ inputs.dev_image || 'us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/tunix/mlperf:latest' }} # zizmor: ignore[unpinned-images]
+      env:
+        JAX_PLATFORMS: cpu
+        TPU_SKIP_MDS_QUERY: "1"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -122,11 +158,8 @@ jobs:
 
       - name: Install the tunix wheel
         run: |
-          python3 -m pip install --upgrade pip setuptools wheel
           WHEEL=$(ls -1 google_tunix-*-py3-none-any.whl | head -n1)
-          python3 -m pip install "${WHEEL}[prod,test,experimental]"
-          # tpu-inference/Numba needs NumPy 2.3 or less.
-          python3 -m pip install numpy==2.3.5 --force-reinstall
+          uv pip install --no-deps "${WHEEL}"
 
       - name: Run vllm driver tests
         run: |
@@ -153,14 +186,23 @@ jobs:
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
 
-      # Cache Hugging Face hub
-      - name: Cache HF hub
+      # Cache Hugging Face hub, Kagglehub, and JAX CPU compilation (excluding
+      # `xet/` staging chunks so the archive stays well under GitHub's 10 GB repo limit).
+      - name: Cache HF hub, Kagglehub, and JAX CPU compilation
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
-          path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'requirements*.txt', 'constraints*.txt') }}
+          path: |
+            ~/.cache/huggingface
+            !~/.cache/huggingface/xet
+            ~/.cache/kagglehub
+            /home/runner/.cache/jax_compilation_cache
+          key: hf-kaggle-jax-v2-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'requirements*.txt', 'constraints*.txt') }}
           restore-keys: |
+            hf-kaggle-jax-v2-${{ runner.os }}-
+            hf-kaggle-jax-${{ runner.os }}-
             hf-${{ runner.os }}-
 
       - name: Download the tunix wheel
@@ -168,12 +210,17 @@ jobs:
         with:
           name: tunix-wheel
 
+      # `--index-strategy unsafe-best-match` allows `uv` to consider versions
+      # across both PyPI and the PyTorch CPU index (`download.pytorch.org/whl/cpu`
+      # hosts an older `requests==2.28.1`, whereas `datasets>=3.0.0` requires
+      # `requests>=2.32.2` from PyPI).
       - name: Install the tunix wheel and dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade uv
           WHEEL=$(ls -1 google_tunix-*-py3-none-any.whl | head -n1)
-          python -m pip install "${WHEEL}[prod,test,experimental]"
-          python -m pip install --upgrade kagglehub kagglesdk torch
+          uv pip install --system --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            "datasets>=3.0.0" "${WHEEL}[prod,test,experimental]" kagglehub kagglesdk torch
 
       - name: Run Smoke tests (model creation)
         env:

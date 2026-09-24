@@ -54,7 +54,7 @@ verify_install() {
 
 compile_protos() {
   echo "Compiling distributed runtime gRPC protobuf definitions..."
-  python3 -m pip install grpcio-tools
+  python3 -c "import grpc_tools.protoc" 2>/dev/null || python3 -m pip install grpcio-tools
 
   local proto_dir="${ROOT_DIR}/tunix/experimental/distributed"
   if [[ ! -d "${proto_dir}" ]]; then
@@ -62,12 +62,17 @@ compile_protos() {
   fi
   local base_dir
   base_dir=$(cd "${proto_dir}/../../.." && pwd)
+  local discovery_proto="${base_dir}/tunix/experimental/distributed/runtime/discovery/discovery_service.proto"
+  if [[ ! -f "${discovery_proto}" ]]; then
+    echo "ERROR: Expected distributed orchestrator proto not found at ${discovery_proto}" >&2
+    exit 1
+  fi
 
-  (
-    cd "${base_dir}"
-    find tunix/experimental/distributed -name "*.proto" -exec \
-      python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. {} +
-  )
+  python3 -m grpc_tools.protoc \
+    -I"${base_dir}" \
+    --python_out="${base_dir}" \
+    --grpc_python_out="${base_dir}" \
+    "${discovery_proto}"
   python3 -c "import tunix.experimental.distributed.runtime.discovery.discovery_service_pb2"
   echo "Distributed protobuf definitions compiled and verified."
 }

@@ -441,8 +441,7 @@ xpk cluster create-pathways \
 
 ### 2. Build a Tunix Docker Image
 
-Build local docker image. We will be using the `build_docker.sh`
-[script](https://github.com/google/tunix/blob/main/build_docker.sh).
+Build a local Docker image from the [`Dockerfile`](https://github.com/google/tunix/blob/main/Dockerfile)
 in the `tunix` directory. If you do not have docker on glinux, please install it
 before building the docker image.
 
@@ -450,9 +449,8 @@ before building the docker image.
 # cleanup unused docker images and caches if disk is not enough
 sudo docker system prune
 
-bash ./build_docker.sh
-# It will default to generate a local docker image
 export LOCAL_IMAGE_NAME=tunix_base_image
+DOCKER_BUILDKIT=1 docker build -t "${LOCAL_IMAGE_NAME}" .
 
 # You can also optionally push to GKE's artifact registry for faster download in the future
 ```

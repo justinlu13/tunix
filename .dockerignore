@@ -1,0 +1,8 @@
+.git
+.github
+.gemini
+.pytest_cache
+__pycache__
+*.pyc
+artifacts
+docs
