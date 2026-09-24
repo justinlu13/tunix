@@ -14,11 +14,17 @@
 
 """MLPerf RCP Logging Utilities for Post-Training (GRPO)."""
 
+import json
 import logging
+import math
 import os
 from typing import Any, Callable, Iterable, Mapping, Optional
-import jax
 import numpy as np
+
+try:
+  import jax
+except ImportError:
+  jax = None
 
 try:
   from mlperf_logging import mllog
@@ -32,6 +38,51 @@ except ImportError:
 
 _gcs_target_path: Optional[str] = None
 _local_log_path: Optional[str] = None
+
+
+def _download_from_gcs_if_exists(gcs_path: str, local_path: str) -> bool:
+  """Downloads an existing GCS mllog file to local_path so events append cleanly."""
+  try:
+    import fsspec  # pylint: disable=g-import-not-at-top
+
+    fs = fsspec.filesystem("gs")
+    if fs.exists(gcs_path):
+      os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+      fs.get(gcs_path, local_path)
+      return True
+    return False
+  except Exception:  # pylint: disable=broad-exception-caught
+    try:
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      if tf.io.gfile.exists(gcs_path):
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+        tf.io.gfile.copy(gcs_path, local_path, overwrite=True)
+        return True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "Failed to check/download existing mllog file %s to %s: %s",
+          gcs_path,
+          local_path,
+          exc,
+      )
+  return False
+
+
+def get_mllog_file_path(
+    metric_logger_dir: Optional[str] = None,
+    seed: Optional[int] = None,
+    filename: Optional[str] = None,
+) -> Optional[str]:
+  """Returns the target MLLOG file path (GCS URI or local path)."""
+  if filename is not None:
+    return filename
+  if metric_logger_dir is not None:
+    if metric_logger_dir.endswith(".out") or metric_logger_dir.endswith(".log"):
+      return metric_logger_dir
+    seed_val = seed if seed is not None else 1
+    return os.path.join(metric_logger_dir.rstrip("/"), f"seed_{seed_val}.out")
+  return _gcs_target_path or _local_log_path
 
 
 def _parse_topology_devices(
@@ -96,7 +147,12 @@ def configure_logger(
     return
 
   seed_val = seed if seed is not None else 1
-  if filename is None and metric_logger_dir is not None:
+  if filename is not None and filename.startswith("gs://"):
+    _gcs_target_path = filename
+    filename = os.path.join(
+        "/tmp/rcp_logs", f"seed_{seed_val}_{os.getpid()}.out"
+    )
+  elif filename is None and metric_logger_dir is not None:
     if metric_logger_dir.startswith("gs://"):
       if metric_logger_dir.endswith(".out") or metric_logger_dir.endswith(
           ".log"
@@ -112,20 +168,30 @@ def configure_logger(
     elif metric_logger_dir.endswith(".out") or metric_logger_dir.endswith(
         ".log"
     ):
+      _gcs_target_path = None
       filename = metric_logger_dir
     else:
+      _gcs_target_path = None
       filename = os.path.join(metric_logger_dir, f"seed_{seed_val}.out")
+  elif filename is not None:
+    _gcs_target_path = None
 
   if filename is not None:
     abs_filename = os.path.abspath(filename)
     _local_log_path = abs_filename
     os.makedirs(os.path.dirname(abs_filename), exist_ok=True)
+    if _gcs_target_path and not os.path.exists(abs_filename):
+      _download_from_gcs_if_exists(_gcs_target_path, abs_filename)
     existing_files = [
         os.path.abspath(getattr(h, "baseFilename", ""))
         for h in getattr(mllogger.logger, "handlers", [])
         if isinstance(h, logging.FileHandler)
     ]
     if abs_filename not in existing_files:
+      for h in list(getattr(mllogger.logger, "handlers", [])):
+        if isinstance(h, logging.FileHandler):
+          mllogger.logger.removeHandler(h)
+          h.close()
       try:
         mllog.config(filename=filename)
       except TypeError:
@@ -227,17 +293,24 @@ def train_start(args=None, step: int = 0, samples_count: Optional[int] = None):
   _flush_to_gcs_if_needed()
 
 
-def block_stop(step: int = 0, samples_count: Optional[int] = None):
+def block_stop(
+    step: int = 0,
+    samples_count: Optional[int] = None,
+    time_ms: Optional[int] = None,
+):
   """Marks the end of a training block."""
   if _is_master_process() and mllogger is not None:
     metadata = {"step": int(step)}
     if samples_count is not None:
       metadata[getattr(constants, "SAMPLES_COUNT", "samples_count")] = int(samples_count)
 
-    mllogger.end(
-        key=getattr(constants, "BLOCK_STOP", "block_stop"),
-        metadata=metadata,
-    )
+    kwargs: dict[str, Any] = {
+        "key": getattr(constants, "BLOCK_STOP", "block_stop"),
+        "metadata": metadata,
+    }
+    if time_ms is not None:
+      kwargs["time_ms"] = int(time_ms)
+    mllogger.end(**kwargs)
 
 
 def train_stop(
@@ -245,8 +318,10 @@ def train_stop(
     step: Optional[int] = None,
     samples_count: Optional[int] = None,
     status: str = "success",
+    time_ms: Optional[int] = None,
 ):
-  """Marks the end of a training block and the training run."""
+  """Marks the end of a training block (run_stop is emitted by evaluation)."""
+  del status
   if args is not None:
     if step is None:
       step = getattr(args, "max_steps", 0)
@@ -257,21 +332,31 @@ def train_stop(
       samples_count = int(step) * global_batch_size
 
   step_val = 0 if step is None else int(step)
-  block_stop(step=step_val, samples_count=samples_count)
-  run_stop(status=status, samples_count=samples_count)
+  block_stop(step=step_val, samples_count=samples_count, time_ms=time_ms)
+  _flush_to_gcs_if_needed()
 
 
-def start_eval(step: int = 0, samples_count: Optional[int] = None):
+train_stop_deferred = train_stop
+
+
+def start_eval(
+    step: int = 0,
+    samples_count: Optional[int] = None,
+    time_ms: Optional[int] = None,
+):
   """Marks the start of an evaluation interval."""
   if _is_master_process() and mllogger is not None:
     metadata = {"step": int(step)}
     if samples_count is not None:
       metadata[getattr(constants, "SAMPLES_COUNT", "samples_count")] = int(samples_count)
 
-    mllogger.start(
-        key=getattr(constants, "EVAL_START", "eval_start"),
-        metadata=metadata,
-    )
+    kwargs: dict[str, Any] = {
+        "key": getattr(constants, "EVAL_START", "eval_start"),
+        "metadata": metadata,
+    }
+    if time_ms is not None:
+      kwargs["time_ms"] = int(time_ms)
+    mllogger.start(**kwargs)
 
 
 def end_eval(
@@ -279,6 +364,7 @@ def end_eval(
     accuracy: float = 0.0,
     samples_count: Optional[int] = None,
     validation_time: Optional[float] = None,
+    time_ms: Optional[int] = None,
 ):
   """Marks the end of an evaluation interval and records eval accuracy."""
   if _is_master_process() and mllogger is not None:
@@ -286,11 +372,16 @@ def end_eval(
     if samples_count is not None:
       metadata[getattr(constants, "SAMPLES_COUNT", "samples_count")] = int(samples_count)
 
+    extra_kwargs: dict[str, Any] = {}
+    if time_ms is not None:
+      extra_kwargs["time_ms"] = int(time_ms)
+
     if validation_time is not None:
       mllogger.event(
           key="tracked_stats",
           value={"validation_time": float(validation_time)},
           metadata={"step": int(step)},
+          **extra_kwargs,
       )
 
     eval_accuracy_metadata = {}
@@ -301,11 +392,189 @@ def end_eval(
         key=getattr(constants, "EVAL_ACCURACY", "eval_accuracy"),
         value=float(accuracy),
         metadata=eval_accuracy_metadata,
+        **extra_kwargs,
     )
     mllogger.end(
         key=getattr(constants, "EVAL_STOP", "eval_stop"),
         metadata=metadata,
+        **extra_kwargs,
     )
+
+
+def log_offline_eval_step(
+    step: int,
+    samples_count: int,
+    eval_accuracy: float,
+    target_accuracy: float = 0.69,
+    checkpoint_timestamp_ms: Optional[int] = None,
+    is_last_checkpoint: bool = False,
+    validation_time: Optional[float] = None,
+    emit_start_eval: bool = True,
+) -> bool:
+  """Logs offline evaluation events for a single checkpoint and emits backdated run_stop if converged or final."""
+  passed = float(eval_accuracy) >= float(target_accuracy)
+  if not (_is_master_process() and mllogger is not None):
+    return passed
+
+  if emit_start_eval:
+    start_eval(step=int(step), samples_count=int(samples_count))
+  end_eval(
+      step=int(step),
+      accuracy=float(eval_accuracy),
+      samples_count=int(samples_count),
+      validation_time=validation_time,
+  )
+  if passed:
+    run_stop(
+        status="success",
+        samples_count=int(samples_count),
+        time_ms=checkpoint_timestamp_ms,
+    )
+    mllogger.event(
+        key=getattr(constants, "TRAIN_SAMPLES", "train_samples"),
+        value=int(samples_count),
+    )
+    _flush_to_gcs_if_needed()
+    return True
+  if is_last_checkpoint:
+    run_stop(
+        status="aborted",
+        samples_count=int(samples_count),
+        time_ms=checkpoint_timestamp_ms,
+    )
+    _flush_to_gcs_if_needed()
+    return False
+
+  _flush_to_gcs_if_needed()
+  return False
+
+
+def compute_val_start_step(
+    global_batch_size: int,
+    val_start_at_override: Optional[int] = None,
+) -> int:
+  """Computes MLPerf policy validation start step: CEIL(2.5 + 3840 / global_batch_size)."""
+  if val_start_at_override is not None and int(val_start_at_override) > 0:
+    return int(val_start_at_override)
+  if int(global_batch_size) <= 0:
+    raise ValueError(
+        f"global_batch_size must be positive, got {global_batch_size}"
+    )
+  return int(math.ceil(2.5 + 3840.0 / float(global_batch_size)))
+
+
+def _read_manifest_text(manifest_path: str) -> str:
+  """Reads text content of manifest_path from GCS or local filesystem if it exists."""
+  if manifest_path.startswith("gs://"):
+    try:
+      import fsspec  # pylint: disable=g-import-not-at-top
+
+      fs = fsspec.filesystem("gs")
+      if not fs.exists(manifest_path):
+        return ""
+      with fs.open(manifest_path, "r", encoding="utf-8") as f:
+        return f.read()
+    except Exception:  # pylint: disable=broad-exception-caught
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      if not tf.io.gfile.exists(manifest_path):
+        return ""
+      with tf.io.gfile.GFile(manifest_path, "r") as f:
+        return f.read()
+  if not os.path.exists(manifest_path):
+    return ""
+  with open(manifest_path, "r", encoding="utf-8") as f:
+    return f.read()
+
+
+def _write_manifest_text(manifest_path: str, content: str) -> None:
+  """Writes text content to manifest_path on GCS or local filesystem."""
+  if manifest_path.startswith("gs://"):
+    try:
+      import fsspec  # pylint: disable=g-import-not-at-top
+
+      fs = fsspec.filesystem("gs")
+      parent = os.path.dirname(manifest_path.rstrip("/"))
+      if parent and parent != "gs:":
+        fs.makedirs(parent, exist_ok=True)
+      with fs.open(manifest_path, "w", encoding="utf-8") as f:
+        f.write(content)
+      return
+    except Exception:  # pylint: disable=broad-exception-caught
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      tf.io.gfile.makedirs(os.path.dirname(manifest_path))
+      with tf.io.gfile.GFile(manifest_path, "w") as f:
+        f.write(content)
+      return
+  parent = os.path.dirname(os.path.abspath(manifest_path))
+  if parent:
+    os.makedirs(parent, exist_ok=True)
+  with open(manifest_path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+
+def append_checkpoint_manifest(
+    manifest_path: str,
+    record: Mapping[str, Any],
+) -> None:
+  """Appends or updates a checkpoint manifest JSONL record (local or gs://)."""
+  if not manifest_path:
+    return
+  existing_text = _read_manifest_text(manifest_path)
+  records_by_step: dict[int, dict[str, Any]] = {}
+  for line in existing_text.splitlines():
+    stripped = line.strip()
+    if not stripped:
+      continue
+    parsed = json.loads(stripped)
+    records_by_step[int(parsed["step"])] = dict(parsed)
+
+  clean_record = dict(record)
+  records_by_step[int(clean_record["step"])] = clean_record
+  sorted_records = [
+      records_by_step[s] for s in sorted(records_by_step.keys())
+  ]
+  content = "\n".join(
+      json.dumps(r, ensure_ascii=False) for r in sorted_records
+  ) + "\n"
+  _write_manifest_text(manifest_path, content)
+
+
+def load_checkpoint_manifest(
+    manifest_path: str,
+    check_contiguous: bool = True,
+) -> list[dict[str, Any]]:
+  """Loads and validates checkpoint manifest records sorted by step."""
+  raw = _read_manifest_text(manifest_path)
+  if not raw.strip():
+    raise FileNotFoundError(
+        f"Checkpoint manifest is missing or empty: {manifest_path}"
+    )
+  records: list[dict[str, Any]] = []
+  for line in raw.splitlines():
+    stripped = line.strip()
+    if stripped:
+      records.append(dict(json.loads(stripped)))
+  records.sort(key=lambda r: int(r["step"]))
+  if check_contiguous and records:
+    expected_first = records[0].get("val_start_at")
+    if expected_first is not None and int(records[0]["step"]) != int(
+        expected_first
+    ):
+      raise ValueError(
+          f"Manifest first step {records[0]['step']} does not match "
+          f"val_start_at={expected_first}"
+      )
+    for idx in range(1, len(records)):
+      prev_step = int(records[idx - 1]["step"])
+      curr_step = int(records[idx]["step"])
+      if curr_step != prev_step + 1:
+        raise ValueError(
+            f"Non-contiguous checkpoint steps in manifest {manifest_path}: "
+            f"step {prev_step} followed by {curr_step}"
+        )
+  return records
 
 
 def check_eval(
@@ -822,17 +1091,24 @@ def create_rcp_metrics_logger(
 rcp_metrics_logger = create_rcp_metrics_logger
 
 
-def run_stop(status: str = "success", samples_count: Optional[int] = None):
+def run_stop(
+    status: str = "success",
+    samples_count: Optional[int] = None,
+    time_ms: Optional[int] = None,
+):
   """Marks the end of the training run."""
   if _is_master_process() and mllogger is not None:
     metadata = {"status": status}
     if samples_count is not None:
       metadata[getattr(constants, "SAMPLES_COUNT", "samples_count")] = int(samples_count)
 
-    mllogger.end(
-        key=getattr(constants, "RUN_STOP", "run_stop"),
-        metadata=metadata,
-    )
+    kwargs: dict[str, Any] = {
+        "key": getattr(constants, "RUN_STOP", "run_stop"),
+        "metadata": metadata,
+    }
+    if time_ms is not None:
+      kwargs["time_ms"] = int(time_ms)
+    mllogger.end(**kwargs)
     _flush_to_gcs_if_needed()
 
 

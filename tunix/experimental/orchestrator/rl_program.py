@@ -365,6 +365,8 @@ class StandardRLProgram(RLProgram):
       ) = trajectory_queue_manager.GroupOrder.ARRIVAL,
       on_step_begin: Callable[[int], None] | None = None,
       on_step_end: Callable[[int, Any], None] | None = None,
+      val_start_step: int | None = None,
+      on_checkpoint_saved: Callable[[dict[str, Any]], None] | None = None,
   ):
     super().__init__()
     self.engine: rl_engine_interface.AbstractRLEngine | None = None
@@ -499,6 +501,9 @@ class StandardRLProgram(RLProgram):
     )
     self.on_step_begin = on_step_begin
     self.on_step_end = on_step_end
+    self.val_start_step = val_start_step
+    self.on_checkpoint_saved = on_checkpoint_saved
+    self.last_step_timestamp_ms: int | None = None
     self._in_flight_rollouts = 0
     self._window_release = asyncio.Event()
     self._dispatch_done = asyncio.Event()
@@ -1394,6 +1399,7 @@ class StandardRLProgram(RLProgram):
       policy_training_time = 0.0
       exposed_generation_time = 0.0
       weight_sync_time = 0.0
+      weight_update_timestamp_ms: int | None = None
 
       current_batch_idx: int | None = None
 
@@ -1405,6 +1411,12 @@ class StandardRLProgram(RLProgram):
             and step_result.get("train_step") is not None
         ):
           optimizer_step = int(step_result["train_step"])
+        if (
+            self.val_start_step is not None
+            and optimizer_step < self.val_start_step
+        ):
+          checkpoint_saved = True
+          return
         next_batch_idx = (
             self.scored_q.next_batch_after(current_batch_idx)
             if isinstance(
@@ -1414,18 +1426,32 @@ class StandardRLProgram(RLProgram):
             and current_batch_idx is not None
             else self.step + 1
         )
-        await self.engine.save_checkpoint(
-            role=datatypes.Role.ACTOR,
-            metadata={
-                "step": optimizer_step,
-                "global_step": self.step + 1,
-                "next_batch_idx": next_batch_idx,
-                "policy_version": self.policy_version + 1,
-                "num_rollouts": num_rollouts,
-                "num_microbatches": num_microbatches,
-            },
+        ckpt_ts_ms = (
+            weight_update_timestamp_ms
+            if weight_update_timestamp_ms is not None
+            else time.time_ns() // 1_000_000
         )
+        ckpt_metadata = {
+            "step": optimizer_step,
+            "global_step": self.step + 1,
+            "next_batch_idx": next_batch_idx,
+            "policy_version": self.policy_version + 1,
+            "num_rollouts": num_rollouts,
+            "num_microbatches": num_microbatches,
+            "weight_update_timestamp_ms": ckpt_ts_ms,
+        }
+        save_resp = await self.engine.save_checkpoint(
+            role=datatypes.Role.ACTOR,
+            metadata=ckpt_metadata,
+        )
+        resp_data = getattr(save_resp, "data", None) or (
+            save_resp if isinstance(save_resp, Mapping) else {}
+        )
+        if isinstance(resp_data, Mapping) and resp_data.get("checkpoint_path"):
+          ckpt_metadata["checkpoint_path"] = str(resp_data["checkpoint_path"])
         checkpoint_saved = True
+        if self.on_checkpoint_saved is not None:
+          self.on_checkpoint_saved(ckpt_metadata)
 
       while groups_consumed < self.full_batch_size:
         _t_gen = time.monotonic()
@@ -1516,6 +1542,8 @@ class StandardRLProgram(RLProgram):
           )
           policy_training_time += time.monotonic() - _t_train
           if mb.is_final_batch:
+            weight_update_timestamp_ms = time.time_ns() // 1_000_000
+            self.last_step_timestamp_ms = weight_update_timestamp_ms
             _t_metrics = time.monotonic()
             trainer_metrics = await self.engine.get_metrics(
                 role=datatypes.Role.ACTOR

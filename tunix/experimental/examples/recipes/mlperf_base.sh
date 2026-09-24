@@ -77,11 +77,15 @@ export ROLLOUT_MESH_FSDP=1
 export ROLLOUT_MESH_TP=1
 
 # ==============================================================================
-# MLPerf RCP Logging
+# MLPerf RCP Logging & Deferred Offline Evaluation
 # ==============================================================================
-export RCP_LOGGING="${RCP_LOGGING:-false}"
+export RCP_LOGGING="${RCP_LOGGING:-true}"
+export DEFERRED_OFFLINE_EVAL="${DEFERRED_OFFLINE_EVAL:-1}"
+export UNSCAN_CHECKPOINT_FOR_EVAL="${UNSCAN_CHECKPOINT_FOR_EVAL:-1}"
+export VAL_START_AT="${VAL_START_AT:-}"
 if [[ -n "${MAXTEXT_OUTPUT_DIR:-}" ]]; then
   export METRIC_LOGGER_DIR="${METRIC_LOGGER_DIR:-${MAXTEXT_OUTPUT_DIR}/mllog}"
+  export CHECKPOINT_MANIFEST_FILE="${CHECKPOINT_MANIFEST_FILE:-${METRIC_LOGGER_DIR}/eval_checkpoints.jsonl}"
 fi
 export TARGET_ACCURACY="${TARGET_ACCURACY:-0.69}"
 
@@ -144,7 +148,7 @@ export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-${BATCH_SIZE}}
 export NUM_GENERATIONS=16
 export TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-32}"
 export CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}
-export CHECKPOINT_MAX_TO_KEEP=10
+export CHECKPOINT_MAX_TO_KEEP="${CHECKPOINT_MAX_TO_KEEP:-35}"
 export CHECKPOINT_ASYNC=${CHECKPOINT_ASYNC:-true}
 export ENABLE_PATHWAYS_PERSISTENCE=${ENABLE_PATHWAYS_PERSISTENCE:-1}
 export MAX_STALENESS=${MAX_STALENESS:-0}
@@ -237,5 +241,74 @@ fi
 if [[ "${MLPERF_NO_LAUNCH:-0}" != "1" ]]; then
   COMMAND="${1:-start}"
   shift || true
+  if [[ "${COMMAND}" == "eval" && -n "${CHECKPOINT_MANIFEST_FILE:-}" && "${RUN_MANIFEST_LOOP:-1}" == "1" ]]; then
+    echo "Running sequential offline evaluation from manifest: ${CHECKPOINT_MANIFEST_FILE}"
+    TUNIX_REPO_ROOT="$(cd "${DIR}/../../../.." && pwd)"
+    mapfile -t MANIFEST_LINES < <(
+      PYTHONPATH="${TUNIX_REPO_ROOT}:${PYTHONPATH:-}" python3 -c '
+import json, os
+from tunix.utils import mllog_utils
+records = mllog_utils.load_checkpoint_manifest(os.environ["CHECKPOINT_MANIFEST_FILE"], check_contiguous=True)
+for idx, rec in enumerate(records):
+    rec = dict(rec)
+    rec["is_last"] = (idx == len(records) - 1)
+    print(json.dumps(rec))
+'
+    )
+    BASE_EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-${MAXTEXT_OUTPUT_DIR}/eval_results}"
+    EVAL_JOBSET_NAME="${EVAL_JOBSET_NAME:-${JOB_PREFIX}-eval}"
+    for line in "${MANIFEST_LINES[@]}"; do
+      [[ -z "${line}" ]] && continue
+      STEP="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "${line}")"
+      SAMPLES="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["samples_count"])' "${line}")"
+      TS_MS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("checkpoint_timestamp_ms", ""))' "${line}")"
+      CKPT_PATH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["checkpoint_path"])' "${line}")"
+      IS_LAST="$(python3 -c 'import json,sys; print("true" if json.loads(sys.argv[1])["is_last"] else "false")' "${line}")"
+
+      echo "=== Evaluating checkpoint step=${STEP} samples=${SAMPLES} is_last=${IS_LAST} path=${CKPT_PATH} ==="
+      export MAXTEXT_CKPT="${CKPT_PATH}"
+      export CHECKPOINT_STEP="${STEP}"
+      export SAMPLES_COUNT="${SAMPLES}"
+      export CHECKPOINT_TIMESTAMP_MS="${TS_MS}"
+      export IS_LAST_CHECKPOINT="${IS_LAST}"
+      export EVAL_OUTPUT_DIR="${BASE_EVAL_OUTPUT_DIR%/}/step_${STEP}"
+      CHECKPOINT_MANIFEST_FILE="" "${LAUNCHER}" --command eval --image "${TUNIX_IMAGE}" "$@"
+
+      if [[ "${DRY_RUN:-false}" != "true" ]]; then
+        HEAD_JOBSET="${EVAL_JOBSET_NAME}"
+        if [[ "${ROLLOUT_REPLICAS:-1}" -gt 1 ]]; then
+          HEAD_JOBSET="${EVAL_JOBSET_NAME}-0"
+        fi
+        kubectl wait --for=condition=complete --timeout=14400s "jobset/${HEAD_JOBSET}" -n "${K8S_NAMESPACE}" || true
+        "${LAUNCHER}" --command stop_eval --image "${TUNIX_IMAGE}" || true
+
+        TARGET_REACHED="$(
+          PYTHONPATH="${TUNIX_REPO_ROOT}:${PYTHONPATH:-}" python3 -c '
+import glob, json, os, subprocess, sys
+out_dir = os.environ["EVAL_OUTPUT_DIR"].rstrip("/")
+if out_dir.startswith("gs://"):
+    res = subprocess.run(["gsutil", "cat", f"{out_dir}/*/summary.json"], capture_output=True, text=True, check=False)
+    if res.returncode == 0 and res.stdout.strip():
+        data = json.loads(res.stdout)
+        print("true" if data.get("target_reached") else "false")
+        sys.exit(0)
+else:
+    matches = sorted(glob.glob(f"{out_dir}/*/summary.json"))
+    if matches:
+        with open(matches[-1], "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print("true" if data.get("target_reached") else "false")
+        sys.exit(0)
+print("false")
+'
+        )"
+        if [[ "${TARGET_REACHED}" == "true" ]]; then
+          echo "Target accuracy ${TARGET_ACCURACY} reached at step ${STEP}. Stopping offline evaluation loop."
+          break
+        fi
+      fi
+    done
+    exit 0
+  fi
   exec "${LAUNCHER}" --command "${COMMAND}" --image "${TUNIX_IMAGE}" "$@"
 fi

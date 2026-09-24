@@ -128,6 +128,64 @@ def parse_args(argv=None):
   )
   p.add_argument("--max_warmpool_size", type=int, default=1)
   p.add_argument("--output_dir", default="eval_results")
+  p.add_argument(
+      "--rcp_logging",
+      type=boolean,
+      nargs="?",
+      const=True,
+      default=os.environ.get("RCP_LOGGING", "0").lower() in ("1", "true"),
+      help="Enable MLPerf RCP (mllog) compliance logging.",
+  )
+  p.add_argument(
+      "--metric_logger_dir",
+      default=os.environ.get("METRIC_LOGGER_DIR", ""),
+      help="Directory or GCS URI for MLPerf RCP output (seed_<seed>.out).",
+  )
+  p.add_argument(
+      "--target_accuracy",
+      type=float,
+      default=float(os.environ.get("TARGET_ACCURACY", "0.69")),
+      help="Target evaluation accuracy for MLPerf RCP compliance logging.",
+  )
+  p.add_argument(
+      "--checkpoint_step",
+      type=int,
+      default=int(os.environ.get("CHECKPOINT_STEP", "0")),
+      help="Optimizer step corresponding to the evaluated checkpoint.",
+  )
+  p.add_argument(
+      "--checkpoint_timestamp_ms",
+      type=int,
+      default=(
+          int(os.environ["CHECKPOINT_TIMESTAMP_MS"])
+          if os.environ.get("CHECKPOINT_TIMESTAMP_MS", "").strip()
+          else None
+      ),
+      help=(
+          "Training epoch timestamp (ms) when the checkpoint weights were "
+          "updated, used to backdate run_stop."
+      ),
+  )
+  p.add_argument(
+      "--samples_count",
+      type=int,
+      default=int(os.environ.get("SAMPLES_COUNT", "0")),
+      help="Cumulative training samples at checkpoint_step.",
+  )
+  p.add_argument(
+      "--is_last_checkpoint",
+      type=boolean,
+      nargs="?",
+      const=True,
+      default=os.environ.get("IS_LAST_CHECKPOINT", "0").lower()
+      in ("1", "true"),
+      help="Whether this checkpoint is the final checkpoint in the manifest.",
+  )
+  p.add_argument(
+      "--checkpoint_manifest_file",
+      default=os.environ.get("CHECKPOINT_MANIFEST_FILE", ""),
+      help="Path or gs:// URI to eval_checkpoints.jsonl manifest.",
+  )
   a = p.parse_args(argv)
   for name in (
       "mesh_fsdp",
@@ -157,8 +215,11 @@ def parse_args(argv=None):
     p.error("Invalid HBM utilization or sampling probabilities")
   if a.tasks_limit < 0 or a.seed < 0 or a.max_context_limit < 0:
     p.error("--tasks_limit, --seed, and --max_context_limit must be nonnegative")
-  if not a.model_absolute_path:
-    p.error("MaxText eval requires --model_absolute_path (Orbax .../items)")
+  if not a.model_absolute_path and not a.checkpoint_manifest_file:
+    p.error(
+        "MaxText eval requires --model_absolute_path (Orbax .../items) "
+        "or --checkpoint_manifest_file"
+    )
   if len(set(a.worker_addresses)) != len(a.worker_addresses):
     p.error("Duplicate worker addresses")
   if a.max_concurrent < len(a.worker_addresses):
@@ -268,7 +329,10 @@ def summarize(rows, instance_ids, attempts):
   total = len(instance_ids) * attempts
   solved = sum(row["resolved"] for row in rows)
   pass_at_k = {}
-  for k in sorted({1, attempts}):
+  ks = {1, attempts}
+  if attempts >= 4:
+    ks.add(4)
+  for k in sorted(ks):
     values = []
     for group in grouped.values():
       c = sum(row["resolved"] for row in group)
@@ -421,8 +485,15 @@ def load_entries(a):
   return entries
 
 
-async def run_controller(a):
+async def _run_single_controller(a):
   from tunix.experimental.worker import remote_execution
+  from tunix.utils import mllog_utils
+
+  if getattr(a, "rcp_logging", False) and getattr(a, "metric_logger_dir", ""):
+    mllog_utils.configure_logger(
+        metric_logger_dir=a.metric_logger_dir,
+        seed=getattr(a, "seed", 42),
+    )
 
   entries = load_entries(a)
   run_id = (
@@ -458,6 +529,7 @@ async def run_controller(a):
   failure = None
   fleet = None
   entry_stream = entries
+  t_eval_start = None
 
   def record(row):
     writer.record(row)
@@ -479,6 +551,12 @@ async def run_controller(a):
         raise ValueError(f"Worker/controller model settings differ: {profile}")
 
     await asyncio.gather(*(ready(h) for h in handles))
+    t_eval_start = time.monotonic()
+    if getattr(a, "rcp_logging", False):
+      mllog_utils.start_eval(
+          step=int(getattr(a, "checkpoint_step", 0)),
+          samples_count=int(getattr(a, "samples_count", 0)),
+      )
     if a.use_agent_sandbox:
       from examples.deepswe import sandbox_utils  # pylint: disable=import-outside-toplevel
 
@@ -535,12 +613,53 @@ async def run_controller(a):
       from examples.deepswe import sandbox_utils  # pylint: disable=import-outside-toplevel
 
       await asyncio.to_thread(sandbox_utils.teardown_global_fleet)
+    validation_time = (
+        time.monotonic() - t_eval_start if t_eval_start is not None else None
+    )
     summary = summarize(
         all_rows,
         [str(e["instance_id"]) for e in entries],
         a.num_rollouts_per_instance,
     )
     summary["fatal_error"] = failure
+    eval_ok = (
+        failure is None
+        and bool(summary.get("complete"))
+        and not summary.get("error_attempts")
+    )
+    pass_at_k = summary.get("pass_at_k") or {}
+    eval_accuracy = float(
+        pass_at_k.get(
+            "4",
+            pass_at_k.get(
+                str(getattr(a, "num_rollouts_per_instance", 4)),
+                summary.get("mean_reward", 0.0),
+            ),
+        )
+    )
+    target_acc = float(getattr(a, "target_accuracy", 0.69))
+    target_reached = bool(eval_ok and eval_accuracy >= target_acc)
+    rcp_logged = False
+    if getattr(a, "rcp_logging", False) and eval_ok:
+      target_reached = mllog_utils.log_offline_eval_step(
+          step=int(getattr(a, "checkpoint_step", 0)),
+          samples_count=int(getattr(a, "samples_count", 0)),
+          eval_accuracy=eval_accuracy,
+          target_accuracy=target_acc,
+          checkpoint_timestamp_ms=getattr(a, "checkpoint_timestamp_ms", None),
+          is_last_checkpoint=bool(getattr(a, "is_last_checkpoint", False)),
+          validation_time=validation_time,
+          emit_start_eval=False,
+      )
+      rcp_logged = True
+    summary["rcp_logged"] = rcp_logged
+    summary["target_accuracy"] = target_acc
+    summary["target_reached"] = bool(target_reached)
+    summary["checkpoint_step"] = int(getattr(a, "checkpoint_step", 0))
+    summary["checkpoint_timestamp_ms"] = getattr(
+        a, "checkpoint_timestamp_ms", None
+    )
+    summary["samples_count"] = int(getattr(a, "samples_count", 0))
     try:
       writer.write("summary.json", summary)
     finally:
@@ -565,6 +684,43 @@ async def run_controller(a):
     raise RuntimeError(
         f"Evaluation contains execution failures; inspect {output}"
     )
+  return summary
+
+
+async def run_controller(a):
+  if getattr(a, "checkpoint_manifest_file", "") and not getattr(
+      a, "model_absolute_path", ""
+  ):
+    from tunix.utils import mllog_utils
+
+    records = mllog_utils.load_checkpoint_manifest(
+        a.checkpoint_manifest_file, check_contiguous=True
+    )
+    last_summary = None
+    for idx, rec in enumerate(records):
+      step_args = argparse.Namespace(**vars(a))
+      step_args.model_absolute_path = str(rec["checkpoint_path"])
+      step_args.checkpoint_step = int(rec["step"])
+      step_args.samples_count = int(rec["samples_count"])
+      step_args.checkpoint_timestamp_ms = (
+          int(rec["checkpoint_timestamp_ms"])
+          if rec.get("checkpoint_timestamp_ms") is not None
+          else None
+      )
+      step_args.is_last_checkpoint = idx == len(records) - 1
+      step_args.output_dir = os.path.join(
+          a.output_dir.rstrip("/"), f"step_{rec['step']}"
+      )
+      last_summary = await _run_single_controller(step_args)
+      if last_summary and last_summary.get("target_reached"):
+        logging.info(
+            "Target accuracy %.4f reached at step %d; stopping manifest loop.",
+            step_args.target_accuracy,
+            step_args.checkpoint_step,
+        )
+        break
+    return last_summary
+  return await _run_single_controller(a)
 
 
 def main(argv=None):

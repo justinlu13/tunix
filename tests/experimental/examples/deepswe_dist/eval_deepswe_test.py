@@ -286,5 +286,198 @@ class RpcTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+mllog_lib = load("mllog_utils_under_test", ROOT / "tunix/utils/mllog_utils.py")
+
+
+class OfflineEvalRcpTest(unittest.IsolatedAsyncioTestCase):
+
+  def test_compute_val_start_step(self):
+    self.assertEqual(mllog_lib.compute_val_start_step(256), 18)
+    self.assertEqual(mllog_lib.compute_val_start_step(128), 33)
+    self.assertEqual(mllog_lib.compute_val_start_step(256, 5), 5)
+    with self.assertRaises(ValueError):
+      mllog_lib.compute_val_start_step(0)
+
+  def test_checkpoint_manifest_read_write_and_contiguity(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      manifest_path = str(Path(tmpdir) / "eval_checkpoints.jsonl")
+      mllog_lib.append_checkpoint_manifest(
+          manifest_path,
+          {
+              "step": 19,
+              "samples_count": 4864,
+              "checkpoint_timestamp_ms": 2000,
+              "checkpoint_path": "gs://ckpt/19/model_params",
+              "val_start_at": 18,
+              "max_steps": 50,
+          },
+      )
+      mllog_lib.append_checkpoint_manifest(
+          manifest_path,
+          {
+              "step": 18,
+              "samples_count": 4608,
+              "checkpoint_timestamp_ms": 1000,
+              "checkpoint_path": "gs://ckpt/18/model_params",
+              "val_start_at": 18,
+              "max_steps": 50,
+          },
+      )
+      records = mllog_lib.load_checkpoint_manifest(
+          manifest_path, check_contiguous=True
+      )
+      self.assertEqual([r["step"] for r in records], [18, 19])
+
+      # Non-contiguous step should raise ValueError
+      mllog_lib.append_checkpoint_manifest(
+          manifest_path,
+          {
+              "step": 21,
+              "samples_count": 5376,
+              "checkpoint_timestamp_ms": 4000,
+              "checkpoint_path": "gs://ckpt/21/model_params",
+              "val_start_at": 18,
+              "max_steps": 50,
+          },
+      )
+      with self.assertRaisesRegex(ValueError, "Non-contiguous"):
+        mllog_lib.load_checkpoint_manifest(
+            manifest_path, check_contiguous=True
+        )
+
+  def test_summarize_includes_pass_at_4(self):
+    rows = [
+        {"instance_id": "inst_1", "attempt": i, "resolved": i == 0, "reward": 1.0 if i == 0 else 0.0, "status": "ok"}
+        for i in range(4)
+    ]
+    summary = eval_lib.summarize(rows, ["inst_1"], 4)
+    self.assertIn("4", summary["pass_at_k"])
+    self.assertAlmostEqual(summary["pass_at_k"]["4"], 1.0)
+    self.assertAlmostEqual(summary["mean_reward"], 0.25)
+
+  def test_offline_eval_rcp_sequence_converged_and_aborted(self):
+    fake_mllogger = mock.MagicMock()
+    with (
+        mock.patch.object(mllog_lib, "mllogger", fake_mllogger),
+        mock.patch.object(mllog_lib, "_is_master_process", return_value=True),
+        mock.patch.object(mllog_lib, "_flush_to_gcs_if_needed"),
+    ):
+      args = types.SimpleNamespace(
+          batch_size=16, num_generations=16, max_steps=50
+      )
+      mllog_lib.train_stop(args, step=50, time_ms=5000)
+      fake_mllogger.end.assert_called_once_with(
+          key="block_stop",
+          metadata={"step": 50, "samples_count": 12800},
+          time_ms=5000,
+      )
+      fake_mllogger.reset_mock()
+
+      # Step 18: accuracy 0.68 < 0.69 -> no run_stop
+      passed_18 = mllog_lib.log_offline_eval_step(
+          step=18,
+          samples_count=4608,
+          eval_accuracy=0.68,
+          target_accuracy=0.69,
+          checkpoint_timestamp_ms=1000,
+          is_last_checkpoint=False,
+          validation_time=12.5,
+      )
+      self.assertFalse(passed_18)
+      end_keys_18 = [c.kwargs["key"] for c in fake_mllogger.end.call_args_list]
+      self.assertEqual(end_keys_18, ["eval_stop"])
+      fake_mllogger.reset_mock()
+
+      # Step 19: accuracy 0.71 >= 0.69 -> backdated run_stop(time_ms=2000, status="success") + train_samples=4864
+      passed_19 = mllog_lib.log_offline_eval_step(
+          step=19,
+          samples_count=4864,
+          eval_accuracy=0.71,
+          target_accuracy=0.69,
+          checkpoint_timestamp_ms=2000,
+          is_last_checkpoint=False,
+          validation_time=14.0,
+      )
+      self.assertTrue(passed_19)
+      fake_mllogger.end.assert_any_call(
+          key="run_stop",
+          metadata={"status": "success", "samples_count": 4864},
+          time_ms=2000,
+      )
+      fake_mllogger.event.assert_any_call(
+          key="train_samples",
+          value=4864,
+      )
+      fake_mllogger.reset_mock()
+
+      # Step 50 (final): accuracy 0.68 < 0.69 -> backdated run_stop(time_ms=5000, status="aborted")
+      passed_50 = mllog_lib.log_offline_eval_step(
+          step=50,
+          samples_count=12800,
+          eval_accuracy=0.68,
+          target_accuracy=0.69,
+          checkpoint_timestamp_ms=5000,
+          is_last_checkpoint=True,
+          validation_time=15.0,
+      )
+      self.assertFalse(passed_50)
+      fake_mllogger.end.assert_any_call(
+          key="run_stop",
+          metadata={"status": "aborted", "samples_count": 12800},
+          time_ms=5000,
+      )
+
+  async def test_controller_manifest_loop_stops_on_convergence(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      manifest_path = str(Path(tmpdir) / "eval_checkpoints.jsonl")
+      for step, ts_ms in ((18, 1000), (19, 2000), (20, 3000)):
+        mllog_lib.append_checkpoint_manifest(
+            manifest_path,
+            {
+                "step": step,
+                "samples_count": step * 256,
+                "checkpoint_timestamp_ms": ts_ms,
+                "checkpoint_path": f"gs://ckpt/{step}/model_params",
+                "val_start_at": 18,
+                "max_steps": 20,
+            },
+        )
+
+      evaluated_steps = []
+
+      async def fake_single_controller(step_args):
+        evaluated_steps.append(step_args.checkpoint_step)
+        reached = step_args.checkpoint_step == 19
+        return {
+            "checkpoint_step": step_args.checkpoint_step,
+            "checkpoint_timestamp_ms": step_args.checkpoint_timestamp_ms,
+            "samples_count": step_args.samples_count,
+            "target_reached": reached,
+            "rcp_logged": True,
+        }
+
+      a = eval_lib.parse_args([
+          "--checkpoint_manifest_file",
+          manifest_path,
+          "--output_dir",
+          str(Path(tmpdir) / "results"),
+      ])
+      with (
+          mock.patch.dict(
+              sys.modules,
+              {"tunix.utils": types.SimpleNamespace(mllog_utils=mllog_lib)},
+          ),
+          mock.patch.object(
+              eval_lib, "_run_single_controller", side_effect=fake_single_controller
+          ),
+      ):
+        summary = await eval_lib.run_controller(a)
+
+      self.assertEqual(evaluated_steps, [18, 19])
+      self.assertTrue(summary["target_reached"])
+      self.assertEqual(summary["checkpoint_step"], 19)
+      self.assertEqual(summary["checkpoint_timestamp_ms"], 2000)
+
+
 if __name__ == "__main__":
   unittest.main()
